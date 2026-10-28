@@ -81,7 +81,8 @@ local function isTraffic(other)
   if other.isAIControlled then return true end
   if CFG.humansCountAsTraffic then return true end
   local name = ac.getDriverName(other.index) or ''
-  return name == '' -- AssettoServer AI cars usually have no real driver name
+  -- AssettoServer names AI cars "<NamePrefix> <id>" (NamePrefix is "Traffic" in extra_cfg.yml)
+  return name == '' or name:sub(1, 7) == 'Traffic'
 end
 
 local function resetRun(reason, color)
@@ -117,7 +118,7 @@ function script.update(dt)
     local hitCar = false
     for i = 1, sim.carsCount - 1 do
       local o = ac.getCar(i)
-      if o and o.isConnected and (o.position - car.position):lengthSquared() < 36 then
+      if o and (o.position - car.position):lengthSquared() < 36 then
         hitCar = true
         break
       end
@@ -138,7 +139,7 @@ function script.update(dt)
     -- near miss detection ----------------------------------------------------
     for i = 1, sim.carsCount - 1 do
       local o = ac.getCar(i)
-      if o and o.isConnected and isTraffic(o) then
+      if o and isTraffic(o) then
         local rel = o.position - car.position
         if rel:lengthSquared() < 900 then -- only cars within 30 m
           local dz = rel:dot(car.look)
