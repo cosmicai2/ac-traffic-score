@@ -1,24 +1,23 @@
 --------------------------------------------------------------------------------
--- TRAFFIC SCORE  |  Assetto Corsa + CSP + AssettoServer
--- Dynamic score counter (speed x time x no-collision x near-miss) + live leaderboard
--- Needs: Custom Shaders Patch (online Lua scripts) and EnableClientMessages: true
+-- TRAFFIC SCORE v2  |  local CSP app (apps/lua/TrafficScore)
+-- Transparent app windows (NO_BACKGROUND): drag/resize them with CSP's normal app controls
 --------------------------------------------------------------------------------
 
 local CFG = {
-  minSpeed       = 100,    -- km/h needed before scoring starts
-  maxMult        = 10,     -- hard cap on the multiplier
-  scoreRate      = 0.10,   -- points per second = speed(km/h) * mult * scoreRate
-  timeGain       = 0.12,   -- multiplier gained per second at 100 km/h (scales with speed)
-  nearMissGap    = 1.6,    -- metres of clearance (side to side) that counts as a near miss
-  nearMissBase   = 120,    -- base bonus points for a near miss
-  comboWindow    = 4.0,    -- seconds to chain near misses
-  comboMultStep  = 0.5,    -- multiplier added per combo level
-  collisionCool  = 1.0,    -- seconds between collision detections
-  leaderboardMax = 8,      -- rows shown
-  staleAfter     = 8.0,    -- seconds before a silent player disappears from the board
-  broadcastEvery = 1.0,    -- seconds between score broadcasts
-  -- set true if you want other human players to count as "traffic" for near misses
+  minSpeed       = 100,
+  maxMult        = 10,
+  scoreRate      = 0.10,
+  timeGain       = 0.12,
+  nearMissGap    = 1.6,
+  nearMissBase   = 120,
+  comboWindow    = 4.0,
+  comboMultStep  = 0.5,
+  collisionCool  = 1.0,
+  leaderboardMax = 8,
+  staleAfter     = 8.0,
+  broadcastEvery = 1.0,
   humansCountAsTraffic = false,
+  baseW          = 520,
 }
 
 local sim = ac.getSim()
@@ -26,72 +25,81 @@ local sim = ac.getSim()
 -- state -----------------------------------------------------------------------
 local score, best = 0, 0
 local timeBonus, combo, comboTimer = 0, 0, 0
-local mult = 1
+local mult, speedMult, proxMult = 1, 1, 1
+local runTime = 0
 local lastCollision = -10
-local popups = {}                 -- {text, color, t, life}
-local nearState = {}              -- [carIndex] = minimal gap while inside zone
-local players = {}                -- [senderIndex] = {name, score, best, t}
+local popups = {}
+local nearState = {}
+local players = {}
 local sendTimer = 0
-local flash = 0                   -- red flash after crash
-local scoreShown = 0              -- smoothed number for the animated counter
-local lastScoreKey = 0
+local flash, bump = 0, 0
+local scoreShown = 0
+local myName = 'Driver'
 
 -- colors ----------------------------------------------------------------------
 local C = {
-  bg     = rgbm(0.04, 0.05, 0.08, 0.72),
+  panel  = rgbm(0.07, 0.08, 0.11, 0.78),
   accent = rgbm(0.10, 0.85, 1.00, 1),
-  gold   = rgbm(1.00, 0.80, 0.15, 1),
+  gold   = rgbm(0.99, 0.75, 0.15, 1),
   green  = rgbm(0.25, 1.00, 0.45, 1),
-  red    = rgbm(1.00, 0.20, 0.20, 1),
+  red    = rgbm(1.00, 0.22, 0.22, 1),
   orange = rgbm(1.00, 0.55, 0.10, 1),
+  purple = rgbm(0.58, 0.25, 0.95, 1),
   white  = rgbm(1, 1, 1, 1),
-  grey   = rgbm(0.65, 0.68, 0.75, 1),
+  grey   = rgbm(0.70, 0.73, 0.80, 1),
+  dark   = rgbm(0.16, 0.09, 0.02, 1),
 }
 
 local function withAlpha(c, a) return rgbm(c.r, c.g, c.b, a) end
 local function clamp(x, a, b) return math.max(a, math.min(b, x)) end
 local function lerp(a, b, t) return a + (b - a) * t end
+local function mix(c1, c2, t) return rgbm(lerp(c1.r, c2.r, t), lerp(c1.g, c2.g, t), lerp(c1.b, c2.b, t), lerp(c1.mult or 1, c2.mult or 1, t)) end
+
+local function fmt(n)
+  local s = tostring(math.floor(n))
+  local r = s:reverse():gsub('(%d%d%d)', '%1,'):reverse()
+  if r:sub(1, 1) == ',' then r = r:sub(2) end
+  return r
+end
+local function fmtTime(t)
+  t = math.floor(t)
+  return string.format('%02d:%02d', math.floor(t / 60), t % 60)
+end
 
 local function pushPopup(text, color, life)
   table.insert(popups, 1, { text = text, color = color, t = 0, life = life or 2.2 })
   if #popups > 4 then table.remove(popups) end
 end
 
--- online leaderboard sync -----------------------------------------------------
+-- online leaderboard sync (no sender object needed) --------------------------------
 local scoreEvent = ac.OnlineEvent({
-  ac.StructItem.key('traffic_score_v1'),
+  ac.StructItem.key('traffic_score_v2'),
+  name  = ac.StructItem.string(24),
   score = ac.StructItem.int32(),
   best  = ac.StructItem.int32(),
-}, function(data, sender)
-  if sender == nil then return end
-  players[sender.index] = {
-    name  = ac.getDriverName(sender.index) or ('Car ' .. sender.index),
-    score = data.score,
-    best  = data.best,
-    t     = os.clock(),
-  }
+}, function(data)
+  local nm = tostring(data.name)
+  if nm == '' or nm == myName then return end
+  players[nm] = { name = nm, score = data.score, best = data.best, t = os.clock() }
 end)
 
 local function broadcast()
-  scoreEvent({ score = math.floor(score), best = math.floor(best) })
+  local n = ac.getDriverName(0)
+  if n and n ~= '' then myName = n end
+  scoreEvent({ name = myName, score = math.floor(score), best = math.floor(best) })
 end
 
--- helpers -----------------------------------------------------------------------
 local function isTraffic(other)
   if other.isAIControlled then return true end
   if CFG.humansCountAsTraffic then return true end
   local name = ac.getDriverName(other.index) or ''
-  -- AssettoServer names AI cars "<NamePrefix> <id>" (NamePrefix is "Traffic" in extra_cfg.yml)
   return name == '' or name:sub(1, 7) == 'Traffic'
 end
 
 local function resetRun(reason, color)
-  if score > 1 then
-    pushPopup(reason .. '  -' .. math.floor(score), color, 2.8)
-  else
-    pushPopup(reason, color, 2.2)
-  end
-  score, timeBonus, combo, comboTimer, mult = 0, 0, 0, 0, 1
+  if score > 1 then pushPopup(reason .. '  -' .. fmt(score), color, 2.8)
+  else pushPopup(reason, color, 2.2) end
+  score, timeBonus, combo, comboTimer, mult, speedMult, proxMult, runTime = 0, 0, 0, 0, 1, 1, 1, 0
   flash = 1
   nearState = {}
   broadcast()
@@ -106,63 +114,57 @@ function script.update(dt)
   local speed = car.speedKmh
   local inPit = car.isInPit or car.isInPitlane
   local driving = (not inPit) and (not sim.isPaused) and (not sim.isReplayActive)
+  if not driving then nearState = {} end
 
-  if not driving then
-    nearState = {}
-  end
-
-  -- collision ---------------------------------------------------------------
   if driving and car.collisionDepth > 0 and (now - lastCollision) > CFG.collisionCool then
     lastCollision = now
-    -- is a car close by? then it is a car hit, otherwise a wall/barrier
     local hitCar = false
     for i = 1, sim.carsCount - 1 do
       local o = ac.getCar(i)
-      if o and (o.position - car.position):lengthSquared() < 36 then
-        hitCar = true
-        break
-      end
+      if o and (o.position - car.position):lengthSquared() < 36 then hitCar = true break end
     end
     resetRun(hitCar and 'COLLISION' or 'CRASHED', C.red)
   end
 
-  -- scoring --------------------------------------------------------------------
   if driving and speed >= CFG.minSpeed then
+    runTime = runTime + dt
     timeBonus = math.min(CFG.maxMult - 1, timeBonus + dt * CFG.timeGain * (speed / 100))
     if comboTimer > 0 then
       comboTimer = comboTimer - dt
       if comboTimer <= 0 then combo = 0 end
     end
-    mult = clamp(1 + timeBonus + combo * CFG.comboMultStep, 1, CFG.maxMult)
+    speedMult = 1 + timeBonus
+    proxMult = 1 + combo * CFG.comboMultStep
+    mult = clamp(speedMult + proxMult - 1, 1, CFG.maxMult)
     score = score + dt * speed * mult * CFG.scoreRate
 
-    -- near miss detection ----------------------------------------------------
     for i = 1, sim.carsCount - 1 do
       local o = ac.getCar(i)
       if o and isTraffic(o) then
         local rel = o.position - car.position
-        if rel:lengthSquared() < 900 then -- only cars within 30 m
+        if rel:lengthSquared() < 900 then
           local dz = rel:dot(car.look)
           local dx = rel:dot(car.side)
-          local gap = math.abs(dx) - 1.9           -- approx. body-to-body clearance
+          local gap = math.abs(dx) - 1.9
           local inZone = math.abs(dz) < 5.0 and gap < CFG.nearMissGap
-          local st = nearState[i]
+          local s0 = nearState[i]
           if inZone then
-            nearState[i] = (st == nil) and gap or math.min(st, gap)
-          elseif st ~= nil and (math.abs(dz) > 6.5 or math.abs(dx) > 6) then
-            -- car left the zone with no collision -> pay out
-            local g = clamp(st, 0, CFG.nearMissGap)
-            local closeness = 1 - g / CFG.nearMissGap        -- 0..1, closer = higher
+            nearState[i] = (s0 == nil) and gap or math.min(s0, gap)
+          elseif s0 ~= nil and (math.abs(dz) > 6.5 or math.abs(dx) > 6) then
+            local g = clamp(s0, 0, CFG.nearMissGap)
+            local closeness = 1 - g / CFG.nearMissGap
             combo = combo + 1
             comboTimer = CFG.comboWindow
-            mult = clamp(1 + timeBonus + combo * CFG.comboMultStep, 1, CFG.maxMult)
+            proxMult = 1 + combo * CFG.comboMultStep
+            mult = clamp(speedMult + proxMult - 1, 1, CFG.maxMult)
             local bonus = CFG.nearMissBase * (0.5 + closeness * 2.5) * mult * (speed / 120)
             score = score + bonus
+            bump = 1
             local label, col
             if g < 0.35 then label, col = 'INSANE NEAR MISS', C.red
             elseif g < 0.8 then label, col = 'GREAT NEAR MISS', C.gold
             else label, col = 'NEAR MISS', C.green end
-            pushPopup(string.format('%s  +%d  x%d', label, math.floor(bonus), combo), col)
+            pushPopup(string.format('%s  +%s  x%d', label, fmt(bonus), combo), col)
             nearState[i] = nil
           end
         else
@@ -172,139 +174,168 @@ function script.update(dt)
     end
   end
 
-  -- best + broadcast --------------------------------------------------------
   if score > best then best = score end
   sendTimer = sendTimer + dt
-  if sendTimer >= CFG.broadcastEvery then
-    sendTimer = 0
-    broadcast()
-  end
+  if sendTimer >= CFG.broadcastEvery then sendTimer = 0 broadcast() end
 
-  -- popup + flash animation ----------------------------------------------------
   for i = #popups, 1, -1 do
     popups[i].t = popups[i].t + dt
     if popups[i].t > popups[i].life then table.remove(popups, i) end
   end
   flash = math.max(0, flash - dt * 1.6)
+  bump = math.max(0, bump - dt * 3)
   scoreShown = lerp(scoreShown, score, clamp(dt * 8, 0, 1))
   if math.abs(scoreShown - score) < 0.5 then scoreShown = score end
 end
 
--- drawing ---------------------------------------------------------------------
-local function text(str, size, pos, color)
-  ui.dwriteDrawText(str, size, pos, color)
+-- drawing helpers (design units * k, relative to origin o) ------------------------
+local function pt(o, k, x, y) return vec2(o.x + x * k, o.y + y * k) end
+
+local function paraPath(o, k, x, y, w, h, sk)
+  ui.pathClear()
+  ui.pathLineTo(pt(o, k, x + sk, y))
+  ui.pathLineTo(pt(o, k, x + w, y))
+  ui.pathLineTo(pt(o, k, x + w - sk, y + h))
+  ui.pathLineTo(pt(o, k, x, y + h))
+end
+local function para(o, k, x, y, w, h, sk, col)
+  paraPath(o, k, x, y, w, h, sk)
+  ui.pathFillConvex(col)
+end
+local function paraLine(o, k, x, y, w, h, sk, col, th)
+  paraPath(o, k, x, y, w, h, sk)
+  ui.pathStroke(col, true, th * k)
 end
 
-local function textCentered(str, size, cx, y, color)
-  local m = ui.measureDWriteText(str, size)
-  ui.dwriteDrawText(str, size, vec2(cx - m.x / 2, y), color)
+-- text: align 'l' (default), 'c' or 'r' around x; y is the top
+local function txt(o, k, str, size, x, y, col, align)
+  local m = ui.measureDWriteText(str, size * k)
+  local px = x * k
+  if align == 'c' then px = px - m.x / 2 elseif align == 'r' then px = px - m.x end
+  ui.dwriteDrawText(str, size * k, vec2(o.x + px, o.y + y * k), col)
 end
 
-local function drawScoreWindow()
+local function drawChip(o, k, x, y, w, h, value, label, col, glow)
+  para(o, k, x, y, w, h, 12, C.panel)
+  para(o, k, x, y, w, 3, 12, withAlpha(col, 0.9))
+  paraLine(o, k, x, y, w, h, 12, withAlpha(col, 0.25 + 0.45 * glow), 1.5)
+  txt(o, k, value, 22, x + w / 2, y + 5, C.white, 'c')
+  txt(o, k, label, 11, x + w / 2, y + h - 17, withAlpha(col, 0.95), 'c')
+end
+
+-- score HUD -------------------------------------------------------------------
+local function drawScoreHUD()
   local car = ac.getCar(0)
   if car == nil then return end
-  local W, H = 440, 250
-  local scr = ac.getUI().windowSize
-  ui.transparentWindow('traffic_score_main', vec2(scr.x / 2 - W / 2, 40), vec2(W, H), function()
-    local o = ui.windowPos()
-    local cx = o.x + W / 2
+  -- fit the whole HUD into whatever space the window has (any size, nothing cut off)
+  local aw, ah = ui.availableSpaceX(), ui.availableSpaceY()
+  local k = clamp(math.min(aw / CFG.baseW, ah / 310), 0.2, 6) * 0.97
+  local o = ui.getCursor() + vec2(math.max(0, (aw - CFG.baseW * k) / 2), 0)
+  ui.dummy(vec2(CFG.baseW * k, 310 * k))
+  do
     local speed = car.speedKmh
     local active = speed >= CFG.minSpeed
+    local t = os.clock()
+    local pulse = 0.5 + 0.5 * math.sin(t * 6)
+    local hot = clamp((mult - 5) / 5, 0, 1)
 
-    -- panel
-    local pulse = 0.5 + 0.5 * math.sin(os.clock() * 6)
-    ui.drawRectFilled(o, o + vec2(W, 150), C.bg, 14)
-    if flash > 0 then
-      ui.drawRectFilled(o, o + vec2(W, 150), withAlpha(C.red, flash * 0.45), 14)
+    -- row 1: chips + total badge
+    drawChip(o, k, 0,   0, 132, 50, string.format('%.1fX', speedMult), 'SPEED',     C.accent, active and pulse or 0)
+    drawChip(o, k, 138, 0, 150, 50, string.format('%.1fX', proxMult),  'PROXIMITY', C.orange, bump)
+    drawChip(o, k, 294, 0, 108, 50, 'x' .. combo,                      'COMBO',     C.gold,   combo > 0 and pulse or 0)
+
+    local shake = (mult >= 9) and math.sin(t * 60) * 1.5 or 0
+    local bx = 408 + shake
+    para(o, k, bx, 0, 112, 50, 12, C.purple)
+    para(o, k, bx, 0, 112, 22, 12, rgbm(1, 1, 1, 0.16))
+    paraLine(o, k, bx, 0, 112, 50, 12, rgbm(1, 1, 1, 0.35 + 0.4 * hot * pulse), 1.5)
+    txt(o, k, string.format('%.1fX', mult), 26 + bump * 4, bx + 56, 6, C.white, 'c')
+    txt(o, k, 'TOTAL', 10, bx + 56, 35, rgbm(1, 1, 1, 0.8), 'c')
+
+    -- row 2: big gold points bar + timer pill
+    local barCol = C.gold
+    if not active then barCol = rgbm(0.45, 0.47, 0.52, 1) end
+    if flash > 0 then barCol = mix(barCol, C.red, clamp(flash * 1.4, 0, 1)) end
+    para(o, k, 0, 58, 404, 62, 14, barCol)
+    para(o, k, 0, 58, 404, 28, 14, rgbm(1, 1, 1, 0.20))
+    paraLine(o, k, 0, 58, 404, 62, 14, rgbm(1, 1, 1, 0.45), 1.5)
+    if active then
+      txt(o, k, fmt(scoreShown) .. ' PTS', 36 + bump * 5, 202, 68, flash > 0.3 and C.white or C.dark, 'c')
+    else
+      txt(o, k, 'REACH ' .. CFG.minSpeed .. ' KM/H TO SCORE', 20, 202, 77, rgbm(1, 1, 1, 0.55 + 0.4 * pulse), 'c')
+      if score > 0 then txt(o, k, fmt(scoreShown) .. ' PTS', 12, 202, 62, rgbm(1, 1, 1, 0.7), 'c') end
     end
-    local edge = active and withAlpha(C.accent, 0.55 + 0.35 * pulse) or withAlpha(C.grey, 0.4)
-    ui.drawRect(o, o + vec2(W, 150), edge, 14, ui.CornerFlags.All, 2)
 
-    -- header
-    textCentered('TRAFFIC SCORE', 14, cx, o.y + 8, C.grey)
-    -- score
-    local scoreCol = active and C.white or C.grey
-    textCentered(string.format('%d', math.floor(scoreShown)), 54, cx, o.y + 26, scoreCol)
+    para(o, k, 410, 58, 110, 62, 14, C.panel)
+    paraLine(o, k, 410, 58, 110, 62, 14, withAlpha(C.accent, 0.4), 1.5)
+    txt(o, k, fmtTime(runTime), 24, 465, 66, C.white, 'c')
+    txt(o, k, string.format('%d KM/H', math.floor(speed)), 12, 465, 98, active and C.green or C.red, 'c')
 
-    -- multiplier + bar
-    local multCol = mult >= 8 and C.red or (mult >= 5 and C.orange or (mult >= 3 and C.gold or C.accent))
-    text(string.format('x%.1f', mult), 26, vec2(o.x + 18, o.y + 100), multCol)
-    local bx, by, bw = o.x + 100, o.y + 112, W - 220
-    ui.drawRectFilled(vec2(bx, by), vec2(bx + bw, by + 12), rgbm(1, 1, 1, 0.12), 6)
-    local frac = (mult - 1) / (CFG.maxMult - 1)
-    ui.drawRectFilled(vec2(bx, by), vec2(bx + bw * frac, by + 12), multCol, 6)
+    -- multiplier meter + combo timer
+    para(o, k, 0, 128, 520, 7, 3, rgbm(1, 1, 1, 0.10))
+    local frac = clamp((mult - 1) / (CFG.maxMult - 1), 0, 1)
+    if frac > 0.02 then
+      local mc = mix(mix(C.accent, C.orange, clamp(frac * 2, 0, 1)), C.red, clamp(frac * 2 - 1, 0, 1))
+      para(o, k, 0, 128, 520 * frac, 7, 3, mc)
+    end
     if combo > 0 then
-      local cf = clamp(comboTimer / CFG.comboWindow, 0, 1)
-      ui.drawRectFilled(vec2(bx, by + 16), vec2(bx + bw * cf, by + 19), C.gold, 2)
+      para(o, k, 0, 138, 520 * clamp(comboTimer / CFG.comboWindow, 0, 1), 3, 2, C.gold)
     end
 
-    -- speed + best
-    text(string.format('%d km/h', math.floor(speed)), 18, vec2(o.x + W - 112, o.y + 98), active and C.green or C.red)
-    text('BEST ' .. math.floor(best), 13, vec2(o.x + W - 112, o.y + 122), C.grey)
-
-    if not active then
-      textCentered('REACH ' .. CFG.minSpeed .. ' KM/H TO SCORE', 13, cx, o.y + 132, withAlpha(C.red, 0.6 + 0.4 * pulse))
-    end
-
-    -- popup notifications stacked below the panel
-    local y = o.y + 160
+    -- popups
+    local y = 150
     for _, p in ipairs(popups) do
       local a = 1
       if p.t < 0.15 then a = p.t / 0.15 end
       if p.t > p.life - 0.5 then a = (p.life - p.t) / 0.5 end
-      local scale = (p.t < 0.2) and (1.35 - 0.35 * (p.t / 0.2)) or 1
-      local m = ui.measureDWriteText(p.text, 20 * scale)
-      ui.drawRectFilled(vec2(cx - m.x / 2 - 12, y - 2), vec2(cx + m.x / 2 + 12, y + m.y + 4),
-        rgbm(0, 0, 0, 0.55 * a), 8)
-      ui.dwriteDrawText(p.text, 20 * scale, vec2(cx - m.x / 2, y), withAlpha(p.color, a))
-      y = y + m.y + 10
-    end
-  end)
-end
-
-local function drawLeaderboardWindow()
-  local W = 270
-  local rowH = 24
-  local rows = {}
-  local now = os.clock()
-  local myIdx = 0
-
-  rows[#rows + 1] = { name = ac.getDriverName(0) or 'You', score = score, best = best, me = true }
-  for idx, p in pairs(players) do
-    if idx ~= myIdx and (now - p.t) < CFG.staleAfter then
-      rows[#rows + 1] = { name = p.name, score = p.score, best = p.best, me = false }
+      local ease = 1 - (1 - clamp(p.t / 0.22, 0, 1)) ^ 3
+      local size = 20
+      local m = ui.measureDWriteText(p.text, size * k)
+      local w = m.x / k + 44
+      local x = 260 - w / 2 + (1 - ease) * -60
+      para(o, k, x, y, w, 34, 10, rgbm(0.05, 0.05, 0.07, 0.8 * a))
+      para(o, k, x, y, 7, 34, 10, withAlpha(p.color, a))
+      paraLine(o, k, x, y, w, 34, 10, withAlpha(p.color, 0.5 * a), 1.2)
+      txt(o, k, p.text, size, x + w / 2 + 3, y + 6, withAlpha(p.color, a), 'c')
+      y = y + 40
     end
   end
-  table.sort(rows, function(a, b) return a.best > b.best end)
+end
 
+-- leaderboard HUD -------------------------------------------------------------
+local function drawBoardHUD()
+  local now = os.clock()
+  local rows = { { name = myName, best = best, me = true } }
+  for _, p in pairs(players) do
+    if (now - p.t) < CFG.staleAfter then rows[#rows + 1] = { name = p.name, best = p.best, me = false } end
+  end
+  table.sort(rows, function(a, b) return a.best > b.best end)
   local count = math.min(#rows, CFG.leaderboardMax)
-  local H = 52 + count * rowH
-  local scr = ac.getUI().windowSize
-  ui.transparentWindow('traffic_score_board', vec2(scr.x - W - 24, 120), vec2(W, H), function()
-    local o = ui.windowPos()
-    ui.drawRectFilled(o, o + vec2(W, H), C.bg, 12)
-    ui.drawRect(o, o + vec2(W, H), withAlpha(C.accent, 0.45), 12, ui.CornerFlags.All, 2)
-    text('LEADERBOARD', 15, vec2(o.x + 14, o.y + 8), C.accent)
-    text('BEST', 11, vec2(o.x + W - 66, o.y + 12), C.grey)
+  local rowH = 32
+  local aw, ah = ui.availableSpaceX(), ui.availableSpaceY()
+  local k = clamp(math.min(aw / 280, ah / (46 + count * rowH)), 0.2, 6) * 0.97
+  local o = ui.getCursor() + vec2(math.max(0, (aw - 280 * k) / 2), 0)
+  ui.dummy(vec2(280 * k, (46 + count * rowH) * k))
+  do
+    para(o, k, 0, 0, 280, 36, 12, C.purple)
+    para(o, k, 0, 0, 280, 15, 12, rgbm(1, 1, 1, 0.16))
+    txt(o, k, 'LEADERBOARD', 17, 24, 8, C.white)
+    txt(o, k, 'BEST', 11, 262, 13, rgbm(1, 1, 1, 0.8), 'r')
     for i = 1, count do
       local r = rows[i]
-      local y = o.y + 36 + (i - 1) * rowH
-      if r.me then
-        ui.drawRectFilled(vec2(o.x + 6, y - 2), vec2(o.x + W - 6, y + rowH - 4), withAlpha(C.accent, 0.18), 6)
-      end
-      local medal = (i == 1 and C.gold) or (i == 2 and rgbm(0.8, 0.8, 0.85, 1)) or (i == 3 and rgbm(0.8, 0.5, 0.25, 1)) or C.grey
-      text(tostring(i), 14, vec2(o.x + 14, y), medal)
+      local y = 42 + (i - 1) * rowH
+      para(o, k, 0, y, 280, rowH - 4, 10, r.me and rgbm(0.35, 0.28, 0.05, 0.85) or C.panel)
+      paraLine(o, k, 0, y, 280, rowH - 4, 10, r.me and withAlpha(C.gold, 0.8) or rgbm(1, 1, 1, 0.12), 1.2)
+      local medal = (i == 1 and C.gold) or (i == 2 and rgbm(0.82, 0.83, 0.9, 1)) or (i == 3 and rgbm(0.82, 0.5, 0.25, 1)) or C.grey
+      para(o, k, 4, y + 3, 26, rowH - 10, 7, withAlpha(medal, 0.9))
+      txt(o, k, tostring(i), 15, 17, y + 4, C.dark, 'c')
       local nm = r.name
       if #nm > 14 then nm = nm:sub(1, 13) .. '.' end
-      text(nm, 14, vec2(o.x + 38, y), r.me and C.white or C.grey)
-      local v = tostring(math.floor(r.best))
-      local m = ui.measureDWriteText(v, 14)
-      text(v, 14, vec2(o.x + W - 14 - m.x, y), r.me and C.gold or C.white)
+      txt(o, k, nm, 15, 42, y + 4, r.me and C.white or C.grey)
+      txt(o, k, fmt(r.best), 15, 262, y + 4, r.me and C.gold or C.white, 'r')
     end
-  end)
+  end
 end
 
-function script.drawUI(dt)
-  drawScoreWindow()
-  drawLeaderboardWindow()
-end
+function script.windowMain(dt) drawScoreHUD() end
+function script.windowLeaderboard(dt) drawBoardHUD() end
