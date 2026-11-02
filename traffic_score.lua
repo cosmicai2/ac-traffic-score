@@ -1,6 +1,9 @@
 --------------------------------------------------------------------------------
--- TRAFFIC SCORE v2  |  local CSP app (apps/lua/TrafficScore)
--- Transparent app windows (NO_BACKGROUND): drag/resize them with CSP's normal app controls
+-- TRAFFIC SCORE v3.3  |  local CSP app (apps/lua/TrafficScore)
+-- Transparent app windows (NO_BACKGROUND): drag/resize them with CSP's normal app controls.
+-- Theme button: the little palette tile at the bottom-right of the score window.
+--   left click = next theme, right click = previous theme (remembered between sessions)
+-- Red is used ONLY for collisions / crashes.
 --------------------------------------------------------------------------------
 
 local CFG = {
@@ -14,8 +17,9 @@ local CFG = {
   comboMultStep  = 0.5,
   collisionCool  = 1.0,
   leaderboardMax = 8,
-  staleAfter     = 8.0,
-  broadcastEvery = 1.0,
+  staleAfter     = 12.0,
+  broadcastEvery = 2.0,   -- min seconds between leaderboard updates while the score is changing
+  heartbeatEvery = 5.0,   -- keep-alive when nothing changed
   humansCountAsTraffic = false,
   baseW          = 520,
 }
@@ -31,20 +35,38 @@ local lastCollision = -10
 local popups = {}
 local nearState = {}
 local players = {}
-local sendTimer = 0
 local flash, bump = 0, 0
 local scoreShown = 0
 local myName = 'Driver'
 
+-- safe calls: every distinct error is logged once instead of every frame ----------
+local seenErrors = {}
+local function guard(tag, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then
+    local msg = tag .. ': ' .. tostring(err)
+    if not seenErrors[msg] then
+      seenErrors[msg] = true
+      if ac.warn then ac.warn('[TrafficScore] ' .. msg)
+      elseif ac.log then ac.log('[TrafficScore] ' .. msg) end
+    end
+  end
+  return ok
+end
+
 -- colors ----------------------------------------------------------------------
+-- NOTE: C.red is reserved for collisions / crashes. Everything else uses the other colors.
 local C = {
   panel  = rgbm(0.07, 0.08, 0.11, 0.78),
   accent = rgbm(0.10, 0.85, 1.00, 1),
   gold   = rgbm(0.99, 0.75, 0.15, 1),
   green  = rgbm(0.25, 1.00, 0.45, 1),
-  red    = rgbm(1.00, 0.22, 0.22, 1),
+  red    = rgbm(1.00, 0.22, 0.22, 1),   -- collisions only
   orange = rgbm(1.00, 0.55, 0.10, 1),
   purple = rgbm(0.58, 0.25, 0.95, 1),
+  insane = rgbm(1.00, 0.20, 0.85, 1),   -- "INSANE NEAR MISS" popup
+  heat   = rgbm(0.95, 0.25, 0.85, 1),   -- hot end of the multiplier meter
+  slow   = rgbm(0.62, 0.68, 0.80, 1),   -- speed readout while below the scoring speed
   white  = rgbm(1, 1, 1, 1),
   grey   = rgbm(0.70, 0.73, 0.80, 1),
   dark   = rgbm(0.16, 0.09, 0.02, 1),
@@ -71,23 +93,142 @@ local function pushPopup(text, color, life)
   if #popups > 4 then table.remove(popups) end
 end
 
--- online leaderboard sync (no sender object needed) --------------------------------
-local scoreEvent = ac.OnlineEvent({
+-- themes ----------------------------------------------------------------------
+-- A theme only overrides colors, so the layout is identical in all of them.
+-- Whatever a theme leaves out falls back to the default (Neon) palette above.
+local THEMES = {
+  { name = 'Neon', colors = {} },
+  { name = 'Synthwave', colors = {
+      panel  = rgbm(0.09, 0.04, 0.16, 0.80), accent = rgbm(0.20, 0.95, 1.00, 1),
+      gold   = rgbm(1.00, 0.35, 0.80, 1),    green  = rgbm(0.45, 1.00, 0.85, 1),
+      orange = rgbm(1.00, 0.60, 0.20, 1),    purple = rgbm(0.45, 0.20, 0.95, 1),
+      insane = rgbm(1.00, 0.95, 0.30, 1),    heat   = rgbm(1.00, 0.95, 0.30, 1),
+      slow   = rgbm(0.70, 0.62, 0.90, 1),    dark   = rgbm(0.14, 0.02, 0.12, 1),
+      grey   = rgbm(0.80, 0.72, 0.95, 1) } },
+  { name = 'Sunset', colors = {
+      panel  = rgbm(0.13, 0.05, 0.07, 0.80), accent = rgbm(1.00, 0.50, 0.40, 1),
+      gold   = rgbm(1.00, 0.62, 0.20, 1),    green  = rgbm(0.70, 1.00, 0.45, 1),
+      orange = rgbm(1.00, 0.45, 0.25, 1),    purple = rgbm(0.82, 0.20, 0.45, 1),
+      insane = rgbm(1.00, 0.35, 0.75, 1),    heat   = rgbm(1.00, 0.35, 0.75, 1),
+      slow   = rgbm(0.80, 0.68, 0.72, 1),    dark   = rgbm(0.22, 0.07, 0.03, 1),
+      grey   = rgbm(0.90, 0.75, 0.72, 1) } },
+  { name = 'Matrix', colors = {
+      panel  = rgbm(0.02, 0.08, 0.04, 0.84), accent = rgbm(0.20, 1.00, 0.50, 1),
+      gold   = rgbm(0.30, 0.95, 0.35, 1),    green  = rgbm(0.55, 1.00, 0.65, 1),
+      orange = rgbm(0.80, 1.00, 0.20, 1),    purple = rgbm(0.08, 0.50, 0.22, 1),
+      insane = rgbm(0.95, 1.00, 0.30, 1),    heat   = rgbm(0.95, 1.00, 0.30, 1),
+      slow   = rgbm(0.45, 0.65, 0.52, 1),    dark   = rgbm(0.00, 0.12, 0.03, 1),
+      grey   = rgbm(0.60, 0.85, 0.70, 1) } },
+  { name = 'Ice', colors = {
+      panel  = rgbm(0.05, 0.09, 0.14, 0.82), accent = rgbm(0.50, 0.90, 1.00, 1),
+      gold   = rgbm(0.78, 0.93, 1.00, 1),    green  = rgbm(0.50, 1.00, 0.85, 1),
+      orange = rgbm(0.60, 0.80, 1.00, 1),    purple = rgbm(0.25, 0.45, 0.90, 1),
+      insane = rgbm(0.95, 0.50, 1.00, 1),    heat   = rgbm(0.95, 0.50, 1.00, 1),
+      slow   = rgbm(0.62, 0.72, 0.85, 1),    dark   = rgbm(0.03, 0.10, 0.18, 1),
+      grey   = rgbm(0.75, 0.85, 0.95, 1) } },
+  { name = 'Mono', colors = {
+      panel  = rgbm(0.08, 0.08, 0.08, 0.84), accent = rgbm(0.90, 0.90, 0.90, 1),
+      gold   = rgbm(0.92, 0.92, 0.92, 1),    green  = rgbm(0.75, 0.95, 0.75, 1),
+      orange = rgbm(0.70, 0.70, 0.70, 1),    purple = rgbm(0.30, 0.30, 0.33, 1),
+      insane = rgbm(1.00, 1.00, 1.00, 1),    heat   = rgbm(1.00, 1.00, 1.00, 1),
+      slow   = rgbm(0.55, 0.55, 0.55, 1),    dark   = rgbm(0.05, 0.05, 0.05, 1),
+      grey   = rgbm(0.70, 0.70, 0.70, 1) } },
+}
+
+local DEFAULT_COLORS = {}
+for k, v in pairs(C) do DEFAULT_COLORS[k] = v end
+
+-- saved theme (falls back to "not remembered" if CSP storage is unavailable)
+local settings = { theme = 1 }
+do
+  local ok, st = pcall(ac.storage, { theme = 1 })
+  if ok and st ~= nil then settings = st end
+end
+
+local currentTheme = 1
+
+local function applyTheme(i)
+  i = clamp(math.floor(tonumber(i) or 1), 1, #THEMES)
+  for k, v in pairs(DEFAULT_COLORS) do C[k] = v end
+  for k, v in pairs(THEMES[i].colors) do C[k] = v end
+  return i
+end
+
+local function setTheme(i)
+  if i < 1 then i = #THEMES elseif i > #THEMES then i = 1 end
+  local applied = applyTheme(i)
+  currentTheme = applied
+  guard('save-theme', function() settings.theme = applied end)
+  pushPopup('THEME  ' .. string.upper(THEMES[applied].name), C.accent, 1.6)
+end
+
+currentTheme = applyTheme(settings.theme)
+
+-- font ------------------------------------------------------------------------
+-- Bahnschrift ships with Windows 10/11 (DIN-style racing look). Each candidate is
+-- tried in turn; if none can be pushed the app silently uses CSP's default font.
+local FONT_CANDIDATES = {
+  function() return ui.DWriteFont('Bahnschrift'):weight(ui.DWriteFont.Weight.SemiBold) end,
+  function() return 'Bahnschrift' end,
+  function() return 'Segoe UI Semibold' end,
+}
+local fontIdx = 1
+local function pushFont()
+  while fontIdx <= #FONT_CANDIDATES do
+    local ok, f = pcall(FONT_CANDIDATES[fontIdx])
+    if ok and f ~= nil and pcall(ui.pushDWriteFont, f) then return true end
+    fontIdx = fontIdx + 1
+  end
+  return false
+end
+local function withFont(tag, fn)
+  local pushed = pushFont()
+  guard(tag, fn)
+  if pushed then pcall(ui.popDWriteFont) end
+end
+
+-- online leaderboard sync -----------------------------------------------------
+local function readScoreEvent(d)
+  if d == nil then return nil end
+  local ok, nm, sc, bs = pcall(function() return tostring(d.name), d.score, d.best end)
+  if ok and sc ~= nil then return nm, sc, bs or 0 end
+  return nil
+end
+
+-- CSP passes (sender, data); older builds passed the data first. Try both.
+local function onScoreEvent(a, b)
+  local nm, sc, bs = readScoreEvent(b)
+  if nm == nil then nm, sc, bs = readScoreEvent(a) end
+  if nm == nil or nm == '' or nm == myName then return end
+  players[nm] = { name = nm, score = sc, best = bs, t = os.clock() }
+end
+
+local okEvent, scoreEvent = pcall(ac.OnlineEvent, {
   ac.StructItem.key('traffic_score_v2'),
   name  = ac.StructItem.string(24),
   score = ac.StructItem.int32(),
   best  = ac.StructItem.int32(),
-}, function(data)
-  local nm = tostring(data.name)
-  if nm == '' or nm == myName then return end
-  players[nm] = { name = nm, score = data.score, best = data.best, t = os.clock() }
-end)
+}, function(a, b) guard('receive', onScoreEvent, a, b) end)
+if not okEvent then scoreEvent = nil end
 
-local function broadcast()
+local lastSent = { s = -1, b = -1, t = -100 }
+local function broadcast(force)
+  if scoreEvent == nil then return end
+  local s, b = math.floor(score), math.floor(best)
+  local now = os.clock()
+  local sinceLast = now - lastSent.t
+  local changed = (s ~= lastSent.s) or (b ~= lastSent.b)
+  if not force and not (changed and sinceLast >= CFG.broadcastEvery) and sinceLast < CFG.heartbeatEvery then return end
   local n = ac.getDriverName(0)
   if n and n ~= '' then myName = n end
-  scoreEvent({ name = myName, score = math.floor(score), best = math.floor(best) })
+  lastSent.s, lastSent.b, lastSent.t = s, b, now
+  guard('send', scoreEvent, { name = myName, score = s, best = b })
 end
+
+guard('name', function()
+  local n = ac.getDriverName(0)
+  if n and n ~= '' then myName = n end
+end)
 
 local function isTraffic(other)
   if other.isAIControlled then return true end
@@ -102,11 +243,11 @@ local function resetRun(reason, color)
   score, timeBonus, combo, comboTimer, mult, speedMult, proxMult, runTime = 0, 0, 0, 0, 1, 1, 1, 0
   flash = 1
   nearState = {}
-  broadcast()
+  broadcast(true)
 end
 
 -- main update -----------------------------------------------------------------
-function script.update(dt)
+local function updateScore(dt)
   local car = ac.getCar(0)
   if car == nil then return end
 
@@ -123,7 +264,7 @@ function script.update(dt)
       local o = ac.getCar(i)
       if o and (o.position - car.position):lengthSquared() < 36 then hitCar = true break end
     end
-    resetRun(hitCar and 'COLLISION' or 'CRASHED', C.red)
+    resetRun(hitCar and 'COLLISION' or 'CRASHED', C.red)   -- the only red in the app
   end
 
   if driving and speed >= CFG.minSpeed then
@@ -161,7 +302,7 @@ function script.update(dt)
             score = score + bonus
             bump = 1
             local label, col
-            if g < 0.35 then label, col = 'INSANE NEAR MISS', C.red
+            if g < 0.35 then label, col = 'INSANE NEAR MISS', C.insane
             elseif g < 0.8 then label, col = 'GREAT NEAR MISS', C.gold
             else label, col = 'NEAR MISS', C.green end
             pushPopup(string.format('%s  +%s  x%d', label, fmt(bonus), combo), col)
@@ -175,8 +316,7 @@ function script.update(dt)
   end
 
   if score > best then best = score end
-  sendTimer = sendTimer + dt
-  if sendTimer >= CFG.broadcastEvery then sendTimer = 0 broadcast() end
+  broadcast()
 
   for i = #popups, 1, -1 do
     popups[i].t = popups[i].t + dt
@@ -187,6 +327,8 @@ function script.update(dt)
   scoreShown = lerp(scoreShown, score, clamp(dt * 8, 0, 1))
   if math.abs(scoreShown - score) < 0.5 then scoreShown = score end
 end
+
+function script.update(dt) guard('update', updateScore, dt) end
 
 -- drawing helpers (design units * k, relative to origin o) ------------------------
 local function pt(o, k, x, y) return vec2(o.x + x * k, o.y + y * k) end
@@ -223,6 +365,40 @@ local function drawChip(o, k, x, y, w, h, value, label, col, glow)
   txt(o, k, label, 11, x + w / 2, y + h - 17, withAlpha(col, 0.95), 'c')
 end
 
+-- theme button (palette tile) --------------------------------------------------
+local THEME_BTN = { x = 484, y = 150, s = 34 }
+
+local function drawThemeIcon(o, k, hovered)
+  local b = THEME_BTN
+  para(o, k, b.x, b.y, b.s, b.s, 8, C.panel)
+  paraLine(o, k, b.x, b.y, b.s, b.s, 8, withAlpha(C.accent, hovered and 1.0 or 0.5), 1.5)
+  local cols = { C.accent, C.gold, C.purple, C.orange }
+  for i = 1, 4 do
+    local cx = b.x + 7 + ((i - 1) % 2) * 12
+    local cy = b.y + 7 + math.floor((i - 1) / 2) * 12
+    para(o, k, cx, cy, 11, 10, 3, cols[i])
+  end
+end
+
+local function themeButton(o, k)
+  local b = THEME_BTN
+  ui.setCursor(vec2(o.x + b.x * k, o.y + b.y * k))
+  local clicked = ui.invisibleButton('##ts_theme', vec2(b.s * k, b.s * k))
+  local hovered = ui.itemHovered()
+  drawThemeIcon(o, k, hovered)
+  if hovered then
+    guard('tooltip', function()
+      ui.setTooltip('Theme: ' .. THEMES[currentTheme].name .. '\nclick = next, right-click = previous')
+    end)
+  end
+  if clicked then setTheme(currentTheme + 1)
+  elseif hovered then
+    guard('right-click', function()
+      if ui.mouseClicked(ui.MouseButton.Right) then setTheme(currentTheme - 1) end
+    end)
+  end
+end
+
 -- score HUD -------------------------------------------------------------------
 local function drawScoreHUD()
   local car = ac.getCar(0)
@@ -252,10 +428,10 @@ local function drawScoreHUD()
     txt(o, k, string.format('%.1fX', mult), 26 + bump * 4, bx + 56, 6, C.white, 'c')
     txt(o, k, 'TOTAL', 10, bx + 56, 35, rgbm(1, 1, 1, 0.8), 'c')
 
-    -- row 2: big gold points bar + timer pill
+    -- row 2: big points bar + timer pill
     local barCol = C.gold
     if not active then barCol = rgbm(0.45, 0.47, 0.52, 1) end
-    if flash > 0 then barCol = mix(barCol, C.red, clamp(flash * 1.4, 0, 1)) end
+    if flash > 0 then barCol = mix(barCol, C.red, clamp(flash * 1.4, 0, 1)) end   -- collision flash
     para(o, k, 0, 58, 404, 62, 14, barCol)
     para(o, k, 0, 58, 404, 28, 14, rgbm(1, 1, 1, 0.20))
     paraLine(o, k, 0, 58, 404, 62, 14, rgbm(1, 1, 1, 0.45), 1.5)
@@ -269,13 +445,13 @@ local function drawScoreHUD()
     para(o, k, 410, 58, 110, 62, 14, C.panel)
     paraLine(o, k, 410, 58, 110, 62, 14, withAlpha(C.accent, 0.4), 1.5)
     txt(o, k, fmtTime(runTime), 24, 465, 66, C.white, 'c')
-    txt(o, k, string.format('%d KM/H', math.floor(speed)), 12, 465, 98, active and C.green or C.red, 'c')
+    txt(o, k, string.format('%d KM/H', math.floor(speed)), 12, 465, 98, active and C.green or C.slow, 'c')
 
     -- multiplier meter + combo timer
     para(o, k, 0, 128, 520, 7, 3, rgbm(1, 1, 1, 0.10))
     local frac = clamp((mult - 1) / (CFG.maxMult - 1), 0, 1)
     if frac > 0.02 then
-      local mc = mix(mix(C.accent, C.orange, clamp(frac * 2, 0, 1)), C.red, clamp(frac * 2 - 1, 0, 1))
+      local mc = mix(mix(C.accent, C.orange, clamp(frac * 2, 0, 1)), C.heat, clamp(frac * 2 - 1, 0, 1))
       para(o, k, 0, 128, 520 * frac, 7, 3, mc)
     end
     if combo > 0 then
@@ -300,14 +476,18 @@ local function drawScoreHUD()
       y = y + 40
     end
   end
+
+  -- theme button (kept separate so a failure here can never break the HUD)
+  guard('theme-button', themeButton, o, k)
 end
 
 -- leaderboard HUD -------------------------------------------------------------
 local function drawBoardHUD()
   local now = os.clock()
   local rows = { { name = myName, best = best, me = true } }
-  for _, p in pairs(players) do
-    if (now - p.t) < CFG.staleAfter then rows[#rows + 1] = { name = p.name, best = p.best, me = false } end
+  for key, p in pairs(players) do
+    if (now - p.t) < CFG.staleAfter then rows[#rows + 1] = { name = p.name, best = p.best or 0, me = false }
+    else players[key] = nil end
   end
   table.sort(rows, function(a, b) return a.best > b.best end)
   local count = math.min(#rows, CFG.leaderboardMax)
@@ -324,7 +504,7 @@ local function drawBoardHUD()
     for i = 1, count do
       local r = rows[i]
       local y = 42 + (i - 1) * rowH
-      para(o, k, 0, y, 280, rowH - 4, 10, r.me and rgbm(0.35, 0.28, 0.05, 0.85) or C.panel)
+      para(o, k, 0, y, 280, rowH - 4, 10, r.me and withAlpha(C.gold, 0.30) or C.panel)
       paraLine(o, k, 0, y, 280, rowH - 4, 10, r.me and withAlpha(C.gold, 0.8) or rgbm(1, 1, 1, 0.12), 1.2)
       local medal = (i == 1 and C.gold) or (i == 2 and rgbm(0.82, 0.83, 0.9, 1)) or (i == 3 and rgbm(0.82, 0.5, 0.25, 1)) or C.grey
       para(o, k, 4, y + 3, 26, rowH - 10, 7, withAlpha(medal, 0.9))
@@ -337,5 +517,5 @@ local function drawBoardHUD()
   end
 end
 
-function script.windowMain(dt) drawScoreHUD() end
-function script.windowLeaderboard(dt) drawBoardHUD() end
+function script.windowMain(dt) withFont('hud', drawScoreHUD) end
+function script.windowLeaderboard(dt) withFont('board', drawBoardHUD) end
