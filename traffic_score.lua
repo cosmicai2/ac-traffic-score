@@ -1,8 +1,10 @@
 --------------------------------------------------------------------------------
--- TRAFFIC SCORE v3.3  |  local CSP app (apps/lua/TrafficScore)
--- Transparent app windows (NO_BACKGROUND): drag/resize them with CSP's normal app controls.
--- Theme button: the little palette tile at the bottom-right of the score window.
---   left click = next theme, right click = previous theme (remembered between sessions)
+-- TRAFFIC SCORE v3.3 (SERVER SCRIPT)  |  loaded by the server via csp_extra_options.ini
+-- Same score HUD + leaderboard as the local app, but needs no manifest or install:
+-- CSP runs this on every player who joins the server.
+--   * palette tile  : left click = next theme, right click = previous theme
+--   * grip tile     : drag to move the HUD, right click = reset position
+--   * theme and position are remembered on each player's PC
 -- Red is used ONLY for collisions / crashes.
 --------------------------------------------------------------------------------
 
@@ -22,6 +24,8 @@ local CFG = {
   heartbeatEvery = 5.0,   -- keep-alive when nothing changed
   humansCountAsTraffic = false,
   baseW          = 520,
+  hudScale       = 0.9,   -- overall HUD size (1.0 = 520 px wide on a 1080p screen)
+  boardGap       = 14,    -- gap between the score HUD and the leaderboard
 }
 
 local sim = ac.getSim()
@@ -38,6 +42,7 @@ local players = {}
 local flash, bump = 0, 0
 local scoreShown = 0
 local myName = 'Driver'
+local T = 0   -- script clock in seconds, advanced in script.update (online scripts can't rely on os.clock)
 
 -- safe calls: every distinct error is logged once instead of every frame ----------
 local seenErrors = {}
@@ -139,9 +144,9 @@ local DEFAULT_COLORS = {}
 for k, v in pairs(C) do DEFAULT_COLORS[k] = v end
 
 -- saved theme (falls back to "not remembered" if CSP storage is unavailable)
-local settings = { theme = 1 }
+local settings = { theme = 1, hudX = -1, hudY = -1 }
 do
-  local ok, st = pcall(ac.storage, { theme = 1 })
+  local ok, st = pcall(ac.storage, { theme = 1, hudX = -1, hudY = -1 }, 'TrafficScore')
   if ok and st ~= nil then settings = st end
 end
 
@@ -162,7 +167,10 @@ local function setTheme(i)
   pushPopup('THEME  ' .. string.upper(THEMES[applied].name), C.accent, 1.6)
 end
 
-currentTheme = applyTheme(settings.theme)
+do
+  local okT, saved = pcall(function() return settings.theme end)
+  currentTheme = applyTheme(okT and saved or 1)
+end
 
 -- font ------------------------------------------------------------------------
 -- Bahnschrift ships with Windows 10/11 (DIN-style racing look). Each candidate is
@@ -200,7 +208,7 @@ local function onScoreEvent(a, b)
   local nm, sc, bs = readScoreEvent(b)
   if nm == nil then nm, sc, bs = readScoreEvent(a) end
   if nm == nil or nm == '' or nm == myName then return end
-  players[nm] = { name = nm, score = sc, best = bs, t = os.clock() }
+  players[nm] = { name = nm, score = sc, best = bs, t = T }
 end
 
 local okEvent, scoreEvent = pcall(ac.OnlineEvent, {
@@ -215,7 +223,7 @@ local lastSent = { s = -1, b = -1, t = -100 }
 local function broadcast(force)
   if scoreEvent == nil then return end
   local s, b = math.floor(score), math.floor(best)
-  local now = os.clock()
+  local now = T
   local sinceLast = now - lastSent.t
   local changed = (s ~= lastSent.s) or (b ~= lastSent.b)
   if not force and not (changed and sinceLast >= CFG.broadcastEvery) and sinceLast < CFG.heartbeatEvery then return end
@@ -247,13 +255,18 @@ local function resetRun(reason, color)
 end
 
 -- main update -----------------------------------------------------------------
+local function carFlag(car, name)
+  local ok, v = pcall(function() return car[name] end)
+  return ok and v or false
+end
+
 local function updateScore(dt)
   local car = ac.getCar(0)
   if car == nil then return end
 
-  local now = os.clock()
+  local now = T
   local speed = car.speedKmh
-  local inPit = car.isInPit or car.isInPitlane
+  local inPit = carFlag(car, 'isInPit') or carFlag(car, 'isInPitlane')
   local driving = (not inPit) and (not sim.isPaused) and (not sim.isReplayActive)
   if not driving then nearState = {} end
 
@@ -328,7 +341,10 @@ local function updateScore(dt)
   if math.abs(scoreShown - score) < 0.5 then scoreShown = score end
 end
 
-function script.update(dt) guard('update', updateScore, dt) end
+function script.update(dt)
+  T = T + dt
+  guard('update', updateScore, dt)
+end
 
 -- drawing helpers (design units * k, relative to origin o) ------------------------
 local function pt(o, k, x, y) return vec2(o.x + x * k, o.y + y * k) end
@@ -380,6 +396,44 @@ local function drawThemeIcon(o, k, hovered)
   end
 end
 
+local MOVE_BTN = { x = 442, y = 150, s = 34 }
+local dragging = false
+local hudPos = nil        -- vec2 in screen pixels; nil = use the default / saved position
+local resetPosRequested = false
+
+local function drawMoveIcon(o, k, hovered)
+  local m = MOVE_BTN
+  para(o, k, m.x, m.y, m.s, m.s, 8, C.panel)
+  paraLine(o, k, m.x, m.y, m.s, m.s, 8, withAlpha(C.accent, (hovered or dragging) and 1.0 or 0.5), 1.5)
+  for i = 0, 2 do   -- three grip bars
+    para(o, k, m.x + 8, m.y + 8 + i * 8, 18, 3, 1, withAlpha(C.grey, 0.9))
+  end
+end
+
+local function moveButton(o, k)
+  local m = MOVE_BTN
+  ui.setCursor(vec2(o.x + m.x * k, o.y + m.y * k))
+  ui.invisibleButton('##ts_move', vec2(m.s * k, m.s * k))
+  local hovered = ui.itemHovered()
+  drawMoveIcon(o, k, hovered)
+  if ui.itemActive() then
+    if hudPos ~= nil then hudPos = hudPos + ui.mouseDelta() end
+    dragging = true
+  elseif dragging then
+    dragging = false
+    guard('save-pos', function() settings.hudX = hudPos.x; settings.hudY = hudPos.y end)
+  end
+  if hovered then
+    guard('move-hint', function()
+      ui.setMouseCursor(ui.MouseCursor.Hand)
+      ui.setTooltip('Drag to move\nright-click = reset position')
+    end)
+    guard('move-reset', function()
+      if ui.mouseClicked(ui.MouseButton.Right) then resetPosRequested = true end
+    end)
+  end
+end
+
 local function themeButton(o, k)
   local b = THEME_BTN
   ui.setCursor(vec2(o.x + b.x * k, o.y + b.y * k))
@@ -411,7 +465,7 @@ local function drawScoreHUD()
   do
     local speed = car.speedKmh
     local active = speed >= CFG.minSpeed
-    local t = os.clock()
+    local t = T
     local pulse = 0.5 + 0.5 * math.sin(t * 6)
     local hot = clamp((mult - 5) / 5, 0, 1)
 
@@ -477,19 +531,23 @@ local function drawScoreHUD()
     end
   end
 
-  -- theme button (kept separate so a failure here can never break the HUD)
+  -- buttons (kept separate so a failure here can never break the HUD)
+  guard('move-button', moveButton, o, k)
   guard('theme-button', themeButton, o, k)
 end
 
 -- leaderboard HUD -------------------------------------------------------------
-local function drawBoardHUD()
-  local now = os.clock()
+local function boardRows()
   local rows = { { name = myName, best = best, me = true } }
   for key, p in pairs(players) do
-    if (now - p.t) < CFG.staleAfter then rows[#rows + 1] = { name = p.name, best = p.best or 0, me = false }
+    if (T - p.t) < CFG.staleAfter then rows[#rows + 1] = { name = p.name, best = p.best or 0, me = false }
     else players[key] = nil end
   end
   table.sort(rows, function(a, b) return a.best > b.best end)
+  return rows
+end
+
+local function drawBoardHUD(rows)
   local count = math.min(#rows, CFG.leaderboardMax)
   local rowH = 32
   local aw, ah = ui.availableSpaceX(), ui.availableSpaceY()
@@ -517,5 +575,45 @@ local function drawBoardHUD()
   end
 end
 
-function script.windowMain(dt) withFont('hud', drawScoreHUD) end
-function script.windowLeaderboard(dt) withFont('board', drawBoardHUD) end
+-- windows (online scripts draw from script.drawUI) ----------------------------
+local function inWindow(tag, id, pos, size, inputs, fn)
+  ui.beginTransparentWindow(id, pos, size, true, inputs)   -- no padding, optional mouse input
+  withFont(tag, fn)
+  ui.endTransparentWindow()
+end
+
+local function defaultHudPos(screen, s)
+  local totalW = (CFG.baseW + CFG.boardGap + 280) * s
+  return vec2(math.max(0, (screen.x - totalW) / 2), 70 * s)
+end
+
+local function drawAll()
+  local screen = ac.getUI().windowSize
+  local s = clamp(screen.y / 1080, 0.6, 2.5) * CFG.hudScale
+
+  if resetPosRequested then   -- right-click on the grip: forget the saved position
+    resetPosRequested = false
+    hudPos = nil
+    guard('reset-pos', function() settings.hudX = -1; settings.hudY = -1 end)
+  end
+
+  if hudPos == nil then   -- saved position, else a sensible default
+    local ok, sx, sy = pcall(function() return settings.hudX, settings.hudY end)
+    if ok and sx and sy and sx >= 0 and sy >= 0 then hudPos = vec2(sx, sy) else hudPos = defaultHudPos(screen, s) end
+  end
+  hudPos = vec2(clamp(hudPos.x, 0, math.max(0, screen.x - 120)), clamp(hudPos.y, 0, math.max(0, screen.y - 80)))
+
+  local pos = hudPos   -- fixed for this frame, even if the grip is dragged while drawing
+  local hudW, hudH = CFG.baseW * s, 310 * s
+  inWindow('hud', 'traffic_score_hud', pos, vec2(hudW, hudH), true, drawScoreHUD)
+
+  local rows = boardRows()
+  local count = math.min(#rows, CFG.leaderboardMax)
+  local boardW, boardH = 280 * s, (46 + count * 32) * s
+  local gap = CFG.boardGap * s
+  local bx = pos.x + hudW + gap
+  if bx + boardW > screen.x then bx = pos.x - gap - boardW end   -- no room on the right: put it on the left
+  inWindow('board', 'traffic_score_board', vec2(math.max(0, bx), pos.y), vec2(boardW, boardH), false, function() drawBoardHUD(rows) end)
+end
+
+function script.drawUI() guard('drawUI', drawAll) end
